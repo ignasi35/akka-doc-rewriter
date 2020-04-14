@@ -25,32 +25,88 @@ object DocRewriter extends App {
   import Environment._
   import Tools._
 
-  private val toBeFixed: Future[Seq[FileContents]] = dirContents
-    .filter(path => path.toFile.isFile && path.toString.endsWith(".md"))
-    .mapAsync(1)(loadContents)
-    .filter {
-      case FileContents(path, lines) =>
-        lines.exists(_.utf8String.contains("@@signature"))
-    }
-    .runWith(Sink.seq[FileContents])
+//  private val toBeFixed: Future[Seq[FileContents]] =
+//    dirContents(markdownBaseDir)
+//      .filter(path => path.toFile.isFile && path.toString.endsWith(".md"))
+//      .mapAsync(8)(loadContents)
+//      .filter {
+//        case FileContents(path, lines) =>
+//          lines.exists(_.utf8String.contains("@@signature"))
+//      }
+//      .runWith(Sink.seq[FileContents])
+//
+  private val scaladslOps: Future[Seq[FileAnchors]] =
+    dirContents(scaladocBaseDir)
+      .filter(path => path.toFile.isFile && path.toString.endsWith(".html"))
+      .mapAsync(1)(loadContents)
+      .map {
+        case FileContents(path, lines) =>
+//          val regex = """<a id=\"""".r() //[^\\[\\(]*[\\(\\[]{1}""".r()
+          val regex = """[^<]*<a id="[a-zA-Z0-9].*""".r()
+          val anchors = lines
+          // bytestring to string
+            .map(_.utf8String)
+            // keep only lines with an interesting content
+            // 486:      <a id="clone():Object"></a><a id="clone():AnyRef"></a>
+            .filter(regex.matches)
+            .map { line =>
+//              println(path + " - " + line.take(80) + "...")
+              line.split("\"")(1)
+            }
+          FileAnchors(path, anchors)
+      }
+      .runWith(Sink.seq[FileAnchors])
 
-  toBeFixed.onComplete(fcs => {
-    println(s"${fcs.map { _.map(_.path) }}")
+  private val javadslOps: Future[Seq[FileAnchors]] =
+    dirContents(javadocBaseDir)
+      .filter(path => path.toFile.isFile && path.toString.endsWith(".html"))
+      .mapAsync(1)(loadContents)
+      .map {
+        case FileContents(path, lines) =>
+//          val regex = """<a id=\"""".r() //[^\\[\\(]*[\\(\\[]{1}""".r()
+          val regex = """[^<]*<a id="[a-zA-Z0-9]*[\\(+{1].*""".r()
+          val anchors = lines
+          // bytestring to string
+            .map(_.utf8String)
+            // keep only lines with an interesting content
+            // 486:      <a id="clone():Object"></a><a id="clone():AnyRef"></a>
+            .filter(regex.matches)
+            .map { line =>
+//              println(path + " - " + line.take(80) + "...")
+              line.split("\"")(1)
+            }
+          FileAnchors(path, anchors)
+      }
+      .runWith(Sink.seq[FileAnchors])
+
+  javadslOps.onComplete(fcs => {
+    fcs.map { _.map(_.methodAnchors.foreach(println)) }
+    if (fcs.isFailure)
+      println(s"$fcs")
     println("Done!")
     system.terminate()
   })
+
 }
 
 object Environment {
-  val baseDir =
+  val markdownBaseDir =
     "/Users/ignasi/git/github/akka/akka/unify-operator-signature-apidoc/akka-docs/src/main/paradox/stream/operators"
 
-  val dirContents: Source[Path, NotUsed] =
+  val scaladocBaseDir =
+    "/Users/ignasi/wip/deleteme/akka-api-docs/doc.akka.io/api/akka/2.6/akka/stream/scaladsl"
+
+  val javadocBaseDir =
+    "/Users/ignasi/wip/deleteme/akka-api-docs/doc.akka.io/japi/akka/2.6/akka/stream/javadsl"
+
+  def dirContents(baseDir: String): Source[Path, NotUsed] =
     Directory
       .walk(new File(baseDir).toPath)
 }
 
 object Tools {
+  case class FileAnchors(path: Path, methodAnchors: Seq[String])
+
   case class FileContents(path: Path, lines: Seq[ByteString])
   // given a Path, return a tuple of the path and the file contents loaded as a sequence of file lines
   def loadContents(path: Path)(implicit exCtx: ExecutionContext,
