@@ -1,6 +1,8 @@
 package com.example
 
 import java.io.File
+import java.io.FileOutputStream
+import java.io.PrintWriter
 import java.nio.file.Path
 
 import akka.Done
@@ -16,6 +18,7 @@ import akka.util.ByteString
 
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
+import scala.util.matching.Regex
 
 object DocRewriter extends App {
 
@@ -25,62 +28,72 @@ object DocRewriter extends App {
   import Environment._
   import Tools._
 
-//  private val toBeFixed: Future[Seq[FileContents]] =
-//    dirContents(markdownBaseDir)
-//      .filter(path => path.toFile.isFile && path.toString.endsWith(".md"))
-//      .mapAsync(8)(loadContents)
-//      .filter {
-//        case FileContents(path, lines) =>
-//          lines.exists(_.utf8String.contains("@@signature"))
-//      }
-//      .runWith(Sink.seq[FileContents])
-//
-  private val scaladslOps: Future[Seq[FileAnchors]] =
-    dirContents(scaladocBaseDir)
-      .filter(path => path.toFile.isFile && path.toString.endsWith(".html"))
-      .mapAsync(1)(loadContents)
-      .map {
+  private val fMarkdownTargets: Future[Seq[FileContents]] =
+    dirContents(markdownBaseDir)
+      .filter(path => path.toFile.isFile && path.toString.endsWith(".md"))
+      .mapAsync(8)(loadContents)
+      .filter {
         case FileContents(path, lines) =>
-//          val regex = """<a id=\"""".r() //[^\\[\\(]*[\\(\\[]{1}""".r()
-          val regex = """[^<]*<a id="[a-zA-Z0-9].*""".r()
-          val anchors = lines
-          // bytestring to string
-            .map(_.utf8String)
-            // keep only lines with an interesting content
-            // 486:      <a id="clone():Object"></a><a id="clone():AnyRef"></a>
-            .filter(regex.matches)
-            .map { line =>
-//              println(path + " - " + line.take(80) + "...")
-              line.split("\"")(1)
-            }
-          FileAnchors(path, anchors)
+          lines.exists(_.utf8String.contains("@@signature"))
       }
-      .runWith(Sink.seq[FileAnchors])
+      .runWith(Sink.seq[FileContents])
 
-  private val javadslOps: Future[Seq[FileAnchors]] =
-    dirContents(javadocBaseDir)
-      .filter(path => path.toFile.isFile && path.toString.endsWith(".html"))
-      .mapAsync(1)(loadContents)
-      .map {
-        case FileContents(path, lines) =>
-//          val regex = """<a id=\"""".r() //[^\\[\\(]*[\\(\\[]{1}""".r()
-          val regex = """[^<]*<a id="[a-zA-Z0-9]*[\\(+{1].*""".r()
-          val anchors = lines
-          // bytestring to string
+  private val fScaladslOps: Future[Seq[FileAnchors]] =
+    loadMethodAnchors(scaladocBaseDir, """[^<]*<a id="[a-zA-Z0-9].*""".r())
+
+  private val fJavadslOps: Future[Seq[FileAnchors]] =
+    loadMethodAnchors(
+      javadocBaseDir,
+      """[^<]*<a id="[a-zA-Z0-9]*[\\(+{1].*""".r()
+    )
+
+  val eventually: Future[Done] =
+    for {
+      markdownTargets: Seq[FileContents] <- fMarkdownTargets
+      scaladslOps: Seq[FileAnchors] <- fScaladslOps
+      javadslOps: Seq[FileAnchors] <- fJavadslOps
+    } yield {
+
+      val scalaRewriteOps: Map[Path, Seq[RewriteCommand]] =
+        buildRewriteOps(markdownTargets, scaladslOps)
+      val javaRewriteOps: Map[Path, Seq[RewriteCommand]] =
+        buildRewriteOps(markdownTargets, javadslOps)
+
+      for {
+        key <- scalaRewriteOps.keySet ++ javaRewriteOps.keySet
+      } yield {
+
+        val targetMap =
+          markdownTargets.map(md => (md.path, md)).toMap
+
+        val apidocStatements =
+          buildApidocStatements(key, scalaRewriteOps, javaRewriteOps)
+        val newContent = {
+          targetMap(key).lines
             .map(_.utf8String)
-            // keep only lines with an interesting content
-            // 486:      <a id="clone():Object"></a><a id="clone():AnyRef"></a>
-            .filter(regex.matches)
-            .map { line =>
-//              println(path + " - " + line.take(80) + "...")
-              line.split("\"")(1)
-            }
-          FileAnchors(path, anchors)
-      }
-      .runWith(Sink.seq[FileAnchors])
+            .filterNot(_.contains("@@signature"))
+            .mkString("\n")
+            .replace("""|## Signature
+                        |
+                        |""".stripMargin, s"""## Signature
+                |
+                |$apidocStatements""".stripMargin)
+        }
 
-  javadslOps.onComplete(fcs => {
-    fcs.map { _.map(_.methodAnchors.foreach(println)) }
+        val printWriter = new PrintWriter(
+          new FileOutputStream(key.toFile.getAbsolutePath)
+        )
+        try {
+          printWriter.write(newContent)
+        } finally {
+          printWriter.close()
+        }
+      }
+
+      Done
+    }
+
+  eventually.onComplete(fcs => {
     if (fcs.isFailure)
       println(s"$fcs")
     println("Done!")
@@ -89,25 +102,21 @@ object DocRewriter extends App {
 
 }
 
-object Environment {
-  val markdownBaseDir =
-    "/Users/ignasi/git/github/akka/akka/unify-operator-signature-apidoc/akka-docs/src/main/paradox/stream/operators"
+object Tools {
+  case class RewriteCommand(target: FileContents,
+                            op: String,
+                            fileAnchor: FileAnchors)
 
-  val scaladocBaseDir =
-    "/Users/ignasi/wip/deleteme/akka-api-docs/doc.akka.io/api/akka/2.6/akka/stream/scaladsl"
+  case class FileAnchors(path: Path, methodAnchors: Seq[String])
 
-  val javadocBaseDir =
-    "/Users/ignasi/wip/deleteme/akka-api-docs/doc.akka.io/japi/akka/2.6/akka/stream/javadsl"
+  case class FileContents(path: Path, lines: Seq[ByteString])
 
   def dirContents(baseDir: String): Source[Path, NotUsed] =
     Directory
       .walk(new File(baseDir).toPath)
-}
 
-object Tools {
-  case class FileAnchors(path: Path, methodAnchors: Seq[String])
+  def opName(path: Path): String = path.getFileName.toString.replace(".md", "")
 
-  case class FileContents(path: Path, lines: Seq[ByteString])
   // given a Path, return a tuple of the path and the file contents loaded as a sequence of file lines
   def loadContents(path: Path)(implicit exCtx: ExecutionContext,
                                system: ActorSystem): Future[FileContents] = {
@@ -129,5 +138,88 @@ object Tools {
         FileContents(path, lines)
       }
   }
+
+  def loadMethodAnchors(
+    baseDir: String,
+    regex: Regex
+  )(implicit exCtx: ExecutionContext, system: ActorSystem) = {
+    dirContents(baseDir)
+      .filter(path => path.toFile.isFile && path.toString.endsWith(".html"))
+      .mapAsync(1)(loadContents)
+      .map {
+        case FileContents(path, lines) =>
+          val anchors = lines
+            .map(_.utf8String)
+            .filter(regex.matches)
+            .map { line =>
+              line.split("\"")(1)
+            }
+          FileAnchors(path, anchors)
+      }
+      .runWith(Sink.seq[FileAnchors])
+
+  }
+
+  def buildRewriteOps(
+    markdownTargets: Seq[FileContents],
+    apidocsAnchors: Seq[FileAnchors]
+  ): Map[Path, Seq[RewriteCommand]] = {
+    markdownTargets
+      .flatMap { markdownTarget =>
+        {
+          val op = opName(markdownTarget.path)
+          apidocsAnchors
+            .map { scaladslOp =>
+              scaladslOp.copy(
+                methodAnchors = scaladslOp.methodAnchors.filter(_.contains(op))
+              )
+            }
+            .filter(_.methodAnchors.nonEmpty)
+            .map(fileAnchor => RewriteCommand(markdownTarget, op, fileAnchor))
+        }
+      }
+      .groupBy(_.target.path)
+      .toMap
+  }
+
+  def buildApidocStatements(key: Path,
+                            scalaRewriteOps: Map[Path, Seq[RewriteCommand]],
+                            javaRewriteOps: Map[Path, Seq[RewriteCommand]]) = {
+    val operatorName = scalaRewriteOps
+      .get(key)
+      .map(_.head.op)
+      .getOrElse(javaRewriteOps.get(key).map(_.head.op).get)
+    val scalaAnchor =
+      scalaRewriteOps
+        .get(key)
+        .map(_.head.fileAnchor.methodAnchors.head)
+        .map { anchor =>
+          s"""scala="#${anchor}" """
+        }
+        .getOrElse(" ")
+    val javaAnchor =
+      javaRewriteOps
+        .get(key)
+        .map(_.head.fileAnchor.methodAnchors.head)
+        .map { anchor =>
+          s"""java="#${anchor}" """
+        }
+        .getOrElse(" ")
+
+    s"""@apidoc[$operatorName](Foo) { $scalaAnchor$javaAnchor}""".stripMargin
+
+  }
+
+}
+
+object Environment {
+  val markdownBaseDir =
+    "/Users/ignasi/git/github/akka/akka/unify-operator-signature-apidoc/akka-docs/src/main/paradox/stream/operators"
+
+  val scaladocBaseDir =
+    "/Users/ignasi/wip/deleteme/akka-api-docs/doc.akka.io/api/akka/2.6/akka/stream/scaladsl"
+
+  val javadocBaseDir =
+    "/Users/ignasi/wip/deleteme/akka-api-docs/doc.akka.io/japi/akka/2.6/akka/stream/javadsl"
 
 }
