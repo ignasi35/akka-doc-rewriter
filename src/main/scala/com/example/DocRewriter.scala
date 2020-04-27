@@ -182,31 +182,46 @@ object Tools {
       .toMap
   }
 
-  def buildApidocStatements(key: Path,
-                            scalaRewriteOps: Map[Path, Seq[RewriteCommand]],
-                            javaRewriteOps: Map[Path, Seq[RewriteCommand]]) = {
+  def buildApidocStatements(
+    key: Path,
+    scalaRewriteOps: Map[Path, Seq[RewriteCommand]],
+    javaRewriteOps: Map[Path, Seq[RewriteCommand]]
+  ): String = {
     val operatorName = scalaRewriteOps
       .get(key)
       .map(_.head.op)
       .getOrElse(javaRewriteOps.get(key).map(_.head.op).get)
-    val scalaAnchor =
-      scalaRewriteOps
-        .get(key)
-        .map(_.head.fileAnchor.methodAnchors.head)
-        .map { anchor =>
-          s"""scala="#${anchor}" """
-        }
-        .getOrElse(" ")
-    val javaAnchor =
-      javaRewriteOps
-        .get(key)
-        .map(_.head.fileAnchor.methodAnchors.head)
-        .map { anchor =>
-          s"""java="#${anchor}" """
-        }
-        .getOrElse(" ")
 
-    s"""@apidoc[$operatorName](Foo) { $scalaAnchor$javaAnchor}""".stripMargin
+    def flattenAnchors(input: Map[Path, Seq[RewriteCommand]],
+                       dsl: String): Iterable[(String, String)] = {
+      input
+        .get(key)
+        .toSeq
+        .flatMap { rewriteCommands =>
+          rewriteCommands.flatMap { rewriteCommand =>
+            rewriteCommand.fileAnchor.methodAnchors.map { methodAnchor =>
+              val typeName =
+                rewriteCommand.fileAnchor.path.getFileName.toString
+                  .replace(".html", "")
+              (typeName, s"""${dsl}="#${methodAnchor}" """)
+            }
+          }
+        }
+    }
+    val anchors: Iterable[(String, String)] = flattenAnchors(
+      scalaRewriteOps,
+      "scala"
+    ) ++ flattenAnchors(javaRewriteOps, "java")
+
+    anchors
+      .groupBy(_._1)
+      .map {
+        case (typeName, anchors) =>
+          s"""@apidoc[$operatorName]($typeName) { ${anchors
+               .map(_._2)
+               .mkString("")}}""".stripMargin
+      }
+      .mkString("\n")
 
   }
 
