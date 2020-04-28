@@ -11,6 +11,7 @@ import akka.actor.ActorSystem
 import akka.stream.ActorAttributes
 import akka.stream.alpakka.file.scaladsl.Directory
 import akka.stream.scaladsl.FileIO
+import akka.stream.scaladsl.Flow
 import akka.stream.scaladsl.Framing
 import akka.stream.scaladsl.Sink
 import akka.stream.scaladsl.Source
@@ -59,8 +60,37 @@ object DocRewriter extends App {
       val javaRewriteOps: Map[Path, Seq[RewriteCommand]] =
         buildRewriteOps(markdownTargets, javadslOps)
 
+      val blacklist =
+        Set(
+          "ask.md",
+          "alsoTo.md",
+          "batchWeighted.md",
+          "buffer.md",
+          "actorRef.md",
+          "collect.md",
+          "collection.md",
+          "combine.md",
+          "completionTimeout.md",
+          "concat.md",
+          "from.md",
+          "fromMaterializer.md",
+          "map.md",
+          "merge.md",
+          "queue.md",
+          "log.md", // too many overloads, breaks `paradox` task
+          "throttle.md", // too many overloads, breaks `paradox` task
+          "idleTimeout.md", // too many overloads, breaks `paradox` task
+          "setup.md",
+          "watch.md",
+          "withBackoff.md",
+          "zip.md",
+          "zipWith.md",
+          "actorRefWithBackpressure.md"
+        )
+
       for {
-        key <- scalaRewriteOps.keySet ++ javaRewriteOps.keySet
+        key <- (scalaRewriteOps.keySet ++ javaRewriteOps.keySet)
+        if !blacklist.contains(key.getFileName.toString)
       } yield {
 
         val targetMap =
@@ -69,15 +99,17 @@ object DocRewriter extends App {
         val apidocStatements =
           buildApidocStatements(key, scalaRewriteOps, javaRewriteOps)
         val newContent = {
-          targetMap(key).lines
+          val asSingleString = targetMap(key).lines
             .map(_.utf8String)
             .filterNot(_.contains("@@signature"))
-            .mkString("\n")
-            .replace("""|## Signature
+            .mkString("", "\n", "\n")
+
+          val cleaned = Tools.headingCleanup(asSingleString)
+
+          // insert apidocStatments
+          cleaned.replace("## Signature", s"""## Signature
                         |
-                        |""".stripMargin, s"""## Signature
-                |
-                |$apidocStatements""".stripMargin)
+                        |$apidocStatements""".stripMargin)
         }
 
         val printWriter = new PrintWriter(
@@ -198,30 +230,111 @@ object Tools {
         .get(key)
         .toSeq
         .flatMap { rewriteCommands =>
-          rewriteCommands.flatMap { rewriteCommand =>
-            rewriteCommand.fileAnchor.methodAnchors.map { methodAnchor =>
-              val typeName =
-                rewriteCommand.fileAnchor.path.getFileName.toString
-                  .replace(".html", "")
-              (typeName, s"""${dsl}="#${methodAnchor}" """)
+          rewriteCommands
+            .filter { rewriteCommand =>
+              val stringPath = rewriteCommand.fileAnchor.path.toString
+              stringPath.contains("javadsl") || stringPath.contains("scaladsl")
+
             }
-          }
+            .flatMap { rewriteCommand =>
+              rewriteCommand.fileAnchor.methodAnchors
+                .map { methodAnchor =>
+                  val typeName =
+                    rewriteCommand.fileAnchor.path.getFileName.toString
+                      .replace(".html", "")
+                  (typeName, s"""${dsl}="#${methodAnchor}" """)
+                }
+                .filterNot {
+                  case (typeName, anchor) =>
+                    typeName.contains("Implicits") ||
+                      typeName.contains("FlowOpsMat") ||
+                      typeName.contains("SubSource") ||
+                      typeName.contains("FlowOps") ||
+                      typeName.contains("SubFlow") ||
+                      typeName.contains("WithContext") ||
+                      typeName.contains("DelayStrategy")
+                }
+            }
         }
     }
-    val anchors: Iterable[(String, String)] = flattenAnchors(
-      scalaRewriteOps,
-      "scala"
-    ) ++ flattenAnchors(javaRewriteOps, "java")
+    val anchors: Iterable[(String, String)] =
+      collapseAnchorsWithObjectPrecedence {
+        flattenAnchors(scalaRewriteOps, "scala") ++ (
+          flattenAnchors(javaRewriteOps, "java")
+            .filterNot {
+              case (_, methodSignature) =>
+                methodSignature.contains("scala.concurrent")
+            }
+        )
+      }
 
     anchors
       .groupBy(_._1)
       .map {
         case (typeName, anchors) =>
-          s"""@apidoc[$operatorName]($typeName) { ${anchors
-               .map(_._2)
+          val className = typeName.replace("$", "")
+          val methodAnchors = anchors.map(_._2)
+          // cleanup false positives
+          val betterMatcher: Regex = s".*#$operatorName[\\(\\[<:]{1}.*".r()
+          val betterMethodAnchors =
+            methodAnchors.filter(betterMatcher.matches)
+
+          s"""@apidoc[$className.$operatorName]($typeName) { ${betterMethodAnchors
                .mkString("")}}""".stripMargin
       }
       .mkString("\n")
+
+  }
+
+  def collapseAnchorsWithObjectPrecedence(
+    anchors: Iterable[(String, String)]
+  ): Iterable[(String, String)] = {
+    val types = anchors.map(_._1)
+    val typesWithoutDuplicates = types.map(_.replace("$", "")).toSet
+    if (types.size != typesWithoutDuplicates.size) {
+      // there's dupes
+      val (objects: Iterable[String], classes) =
+        types.toSet.partition(_.endsWith("$"))
+      val cleanClasses =
+        classes.filterNot(cls => objects.toSeq.contains(cls + "$"))
+      val newTypes = (objects ++ cleanClasses).toSeq
+      anchors.filter { case (cls, anchor) => newTypes.contains(cls) }
+    } else {
+      anchors
+    }
+  }
+
+  def headingCleanup(oldContent: String): String = {
+    oldContent
+    // remove trailing blank lines
+      .replace("""|## Signature
+                  |""".stripMargin, s"## Signature")
+      .replace("""|## Signature
+                  |""".stripMargin, s"## Signature")
+      .replace("""|## Signature
+                  |""".stripMargin, s"## Signature")
+      // remove previous blank lines
+      .replace("""|
+                  |## Signature""".stripMargin, s"## Signature")
+      .replace("""|
+                  |## Signature""".stripMargin, s"## Signature")
+      // fix  @@@ div syntax
+      .replace("@@@ div { .group-scala }", "@@@div { .group-scala }")
+      .replace("@@@ div { .group-java }", "@@@div { .group-java }")
+      // remove wrapping @@@div
+      .replace(
+        """|@@@div { .group-scala }## Signature@@@""".stripMargin,
+        "## Signature"
+      )
+      .replace("""|@@@div { .group-scala }## Signature
+          |@@@""".stripMargin, "## Signature")
+      .replace(
+        """|@@@div { .group-java }## Signature@@@""".stripMargin,
+        "## Signature"
+      )
+      .replace("""|@@@div { .group-java }## Signature
+          |@@@""".stripMargin, "## Signature")
+      .replace("## Signature", "## Signature\n")
 
   }
 
