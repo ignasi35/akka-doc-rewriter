@@ -63,28 +63,10 @@ object DocRewriter extends App {
       val blacklist =
         Set(
           "ask.md",
-          "alsoTo.md",
-          "batchWeighted.md",
-          "buffer.md",
           "actorRef.md",
-          "collect.md",
-          "collection.md",
-          "combine.md",
-          "completionTimeout.md",
-          "concat.md",
           "from.md",
           "fromMaterializer.md",
           "map.md",
-          "merge.md",
-          "queue.md",
-          "log.md", // too many overloads, breaks `paradox` task
-          "throttle.md", // too many overloads, breaks `paradox` task
-          "idleTimeout.md", // too many overloads, breaks `paradox` task
-          "setup.md",
-          "watch.md",
-          "withBackoff.md",
-          "zip.md",
-          "zipWith.md",
           "actorRefWithBackpressure.md"
         )
 
@@ -342,7 +324,7 @@ object Tools {
 
 object Environment {
   val markdownBaseDir =
-    "/Users/ignasi/git/github/akka/akka/unify-operator-signature-apidoc/akka-docs/src/main/paradox/stream/operators"
+    "/Users/ignasi/git/github/akka/akka/some-more-signature-to-apidoc-reviews/akka-docs/src/main/paradox/stream/operators"
 
   val scaladocBaseDir =
     "/Users/ignasi/wip/deleteme/akka-api-docs/doc.akka.io/api/akka/2.6/akka/stream/scaladsl"
